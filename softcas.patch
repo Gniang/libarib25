@@ -1,0 +1,1216 @@
+--- CMakeLists.txt
++++ CMakeLists.txt
+@@ -12,12 +12,9 @@
+ include(GitRevision)
+ include(GenerateExportHeader)
+ include(GNUInstallDirs)
+-find_package(PCSC REQUIRED)
+ 
+ if (UNIX OR MSYS)
+ 	find_program(LDCONFIG_EXECUTABLE "ldconfig")
+-	set(WITH_PCSC_PACKAGE "libpcsclite" CACHE STRING "pkg-config package name for PC/SC")
+-	set(WITH_PCSC_LIBRARY "" CACHE STRING "library name for PC/SC")
+ endif()
+ 
+ if(WIN32)
+@@ -98,18 +95,10 @@
+ 
+ add_definitions("-D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64")
+ include_directories(${CMAKE_CURRENT_BINARY_DIR})
+-if(PCSC_INCLUDE_DIRS)
+-	include_directories(${PCSC_INCLUDE_DIRS})
+-endif()
+-link_directories(${PCSC_LIBRARY_DIRS})
+ 
+-add_library(arib25-objlib OBJECT src/arib_std_b25.c src/b_cas_card.c src/multi2.cc src/ts_section_parser.c src/version.c)
++add_library(arib25-objlib OBJECT src/arib_std_b25.c src/b_cas_card.c src/bcas_crypt.c src/decode_ecm.c src/multi2.cc src/ts_section_parser.c src/version.c)
+ set_target_properties(arib25-objlib PROPERTIES COMPILE_DEFINITIONS ARIB25_DLL)
+ 
+-add_library(arib25-static STATIC $<TARGET_OBJECTS:arib25-objlib>)
+-set_target_properties(arib25-static PROPERTIES OUTPUT_NAME ${ARIB25_LIB_NAME})
+-target_link_libraries(arib25-static PRIVATE ${PCSC_LIBRARIES})
+-
+ add_library(arib25-shared SHARED $<TARGET_OBJECTS:arib25-objlib> ${CMAKE_CURRENT_BINARY_DIR}/version.rc)
+ set_target_properties(arib25-shared PROPERTIES MACOSX_RPATH ON)
+ set_target_properties(arib25-shared PROPERTIES DEFINE_SYMBOL ARIB25_DLL)
+@@ -117,12 +106,11 @@
+ set_target_properties(arib25-shared PROPERTIES OUTPUT_NAME ${ARIB25_LIB_NAME})
+ set_target_properties(arib25-shared PROPERTIES SOVERSION ${ARIB25_MAJOR_VERSION})
+ set_target_properties(arib25-shared PROPERTIES VERSION ${ARIB25_VERSION_NUMBER})
+-target_link_libraries(arib25-shared PRIVATE ${PCSC_LIBRARIES})
++target_link_libraries(arib25-shared PRIVATE ${CMAKE_DL_LIBS})
+ generate_export_header(arib25-shared BASE_NAME arib25_api EXPORT_FILE_NAME arib25_api.h)
+ 
+ add_executable(b25 src/td.c ${CMAKE_CURRENT_BINARY_DIR}/version.rc)
+ set_target_properties(b25 PROPERTIES OUTPUT_NAME ${ARIB25_CMD_NAME})
+-target_link_libraries(b25 PRIVATE ${PCSC_LIBRARIES})
+ target_link_libraries(b25 PRIVATE arib25-shared)
+ 
+ configure_file(src/config.h.in config.h @ONLY)
+@@ -132,10 +120,10 @@
+ 	configure_file(src/libarib25.pc.in ${CMAKE_SHARED_LIBRARY_PREFIX}${ARIB25_LIB_NAME}.pc @ONLY)
+ 
+ 	install(TARGETS b25 RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+-	install(TARGETS arib25-static arib25-shared ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+-	install(FILES src/arib_std_b25.h src/b_cas_card.h src/multi2.h src/ts_section_parser.h src/portable.h ${CMAKE_CURRENT_BINARY_DIR}/arib25_api.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/arib25)
+-	install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}${ARIB25_LIB_NAME}.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
++	install(TARGETS arib25-shared ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
++	install(FILES src/arib_std_b25.h src/arib_std_b25_error_code.h src/b_cas_card.h src/portable.h ${CMAKE_CURRENT_BINARY_DIR}/arib25_api.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/arib25)
+ 	install(CODE "execute_process(COMMAND ${CMAKE_COMMAND} -DLDCONFIG_EXECUTABLE=${LDCONFIG_EXECUTABLE} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/PostInstall.cmake)")
++	install(FILES libarib25.conf DESTINATION ${CMAKE_INSTALL_LIBDIR})
+ 	
+ 	add_custom_target(uninstall ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Uninstall.cmake)
+ endif()
+
+--- libarib25.conf
++++ libarib25.conf
+@@ -0,0 +1,4 @@
++Kw02 = 08 0000000000000000 09 0000000000000000 WOWOW
++Kw03 = 06 0000000000000000 05 0000000000000000 Star Channel HD
++Kw17 = 08 0000000000000000 07 0000000000000000 SkyPerfecTV
++Kw1e = 02 0000000000000000 01 0000000000000000 NHK
+
+--- src/b_cas_card.c
++++ src/b_cas_card.c
+@@ -1,70 +1,40 @@
+-#include "b_cas_card.h"
+-#include "b_cas_card_error_code.h"
+-
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#define __USE_GNU
++#include <dlfcn.h>
+ 
+-#include <math.h>
+-
+-#if defined(_WIN32)
+-#  include <windows.h>
+-#  include <tchar.h>
+-#else
+-#  if !defined(__CYGWIN__)
+-#    include <wintypes.h>
+-#  endif
+-#  define _tcslen strlen
+-#endif
+-#include <winscard.h>
++#include "b_cas_card.h"
++#include "b_cas_card_error_code.h"
++#include "decode_ecm.h"
+ 
+ /*+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+  inner structures
+  ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+ typedef struct {
+-	
+-	SCARDCONTEXT       mng;
+-	SCARDHANDLE        card;
+-
+-	uint8_t           *pool;
+-	LPTSTR             reader;
+-
+-	uint8_t           *sbuf;
+-	uint8_t           *rbuf;
+-
+-	B_CAS_INIT_STATUS  stat;
+-	
+-	B_CAS_ID           id;
+-	int32_t            id_max;
+-
+-	B_CAS_PWR_ON_CTRL_INFO pwc;
+-	int32_t            pwc_max;
+-	
++	B_CAS_INIT_STATUS stat;
+ } B_CAS_CARD_PRIVATE_DATA;
+ 
+ /*+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+  constant values
+  ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+-static const uint8_t INITIAL_SETTING_CONDITIONS_CMD[] = {
+-	0x90, 0x30, 0x00, 0x00, 0x00,
+-};
+-
+-static const uint8_t CARD_ID_INFORMATION_ACQUIRE_CMD[] = {
+-	0x90, 0x32, 0x00, 0x00, 0x00,
+-};
++static const char CONF_FILE[] = "libarib25.conf";
++static const char LIB_DIR[] = "/usr/local/lib/";
+ 
+-static const uint8_t POWER_ON_CONTROL_INFORMATION_REQUEST_CMD[] = {
+-	0x90, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00,
++static const uint8_t BCAS_SYSTEM_KEY[] = {
++	0x36, 0x31, 0x04, 0x66, 0x4b, 0x17, 0xea, 0x5c,
++	0x32, 0xdf, 0x9c, 0xf5, 0xc4, 0xc3, 0x6c, 0x1b,
++	0xec, 0x99, 0x39, 0x21, 0x68, 0x9d, 0x4b, 0xb7,
++	0xb7, 0x4e, 0x40, 0x84, 0x0d, 0x2e, 0x7d, 0x98
+ };
+ 
+-static const uint8_t ECM_RECEIVE_CMD_HEADER[] = {
+-	0x90, 0x34, 0x00, 0x00,
++static const uint8_t BCAS_INIT_CBC[] = {
++	0xfe, 0x27, 0x19, 0x99, 0x19, 0x69, 0x09, 0x11
+ };
+ 
+-static const uint8_t EMM_RECEIVE_CMD_HEADER[] = {
+-	0x90, 0x36, 0x00, 0x00,
+-};
++static const int64_t BCAS_CARD_ID = 0xffffffffffff0150;
+ 
+-#define B_CAS_BUFFER_MAX (4*1024)
++static const int32_t BCAS_CA_SYSTEM_ID = 0x0005;
+ 
+ /*+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+  function prottypes (interface method)
+@@ -83,7 +53,7 @@
+ ARIB25_API_EXPORT B_CAS_CARD *create_b_cas_card()
+ {
+ 	int n;
+-	
++
+ 	B_CAS_CARD *r;
+ 	B_CAS_CARD_PRIVATE_DATA *prv;
+ 
+@@ -112,89 +82,52 @@
+  function prottypes (private method)
+  ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+ static B_CAS_CARD_PRIVATE_DATA *private_data(void *bcas);
+-static void teardown(B_CAS_CARD_PRIVATE_DATA *prv);
+-static int change_id_max(B_CAS_CARD_PRIVATE_DATA *prv, int max);
+-static int change_pwc_max(B_CAS_CARD_PRIVATE_DATA *prv, int max);
+-static int connect_card(B_CAS_CARD_PRIVATE_DATA *prv, LPCTSTR reader_name);
+-static void extract_power_on_ctrl_response(B_CAS_PWR_ON_CTRL *dst, uint8_t *src);
+-static void extract_mjd(int *yy, int *mm, int *dd, int mjd);
+-static int setup_ecm_receive_command(uint8_t *dst, uint8_t *src, int len);
+-static int setup_emm_receive_command(uint8_t *dst, uint8_t *src, int len);
+-static int32_t load_be_uint16(uint8_t *p);
+-static int64_t load_be_uint48(uint8_t *p);
++static int LoadKeyset();
++static uint64_t pickup_hex(char **pp, int n);
+ 
+ /*+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+  interface method implementation
+  ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+ static void release_b_cas_card(void *bcas)
+ {
++	int i;
+ 	B_CAS_CARD_PRIVATE_DATA *prv;
+ 
++	for(i=0;i<MAX_KEY_COUNT;i++){
++		if(KeysetTable[i] == NULL){
++			break;
++		}
++		free(KeysetTable[i]);
++	}
++
+ 	prv = private_data(bcas);
+ 	if(prv == NULL){
+-		/* do nothing */
+ 		return;
+ 	}
+ 
+-	teardown(prv);
+ 	free(prv);
+ }
+ 
+ static int init_b_cas_card(void *bcas)
+ {
+-	int m;
+-	LONG ret;
+-	DWORD len;
+-	
++	int code;
+ 	B_CAS_CARD_PRIVATE_DATA *prv;
+ 
++	code = LoadKeyset();
++	if (code < 0) {
++		return code;
++	}
++
+ 	prv = private_data(bcas);
+ 	if(prv == NULL){
+ 		return B_CAS_CARD_ERROR_INVALID_PARAMETER;
+ 	}
+ 
+-	teardown(prv);
+-
+-	ret = SCardEstablishContext(SCARD_SCOPE_USER, NULL, NULL, &(prv->mng));
+-	if(ret != SCARD_S_SUCCESS){
+-		return B_CAS_CARD_ERROR_NO_SMART_CARD_READER;
+-	}
+-
+-	ret = SCardListReaders(prv->mng, NULL, NULL, &len);
+-	if(ret != SCARD_S_SUCCESS){
+-		return B_CAS_CARD_ERROR_NO_SMART_CARD_READER;
+-	}
+-	len += 256;
+-	
+-	m = len + (2*B_CAS_BUFFER_MAX) + (sizeof(int64_t)*16) + (sizeof(B_CAS_PWR_ON_CTRL)*16);
+-	prv->pool = (uint8_t *)malloc(m);
+-	if(prv->pool == NULL){
+-		return B_CAS_CARD_ERROR_NO_ENOUGH_MEMORY;
+-	}
+-
+-	prv->reader = (LPTSTR)(prv->pool);
+-	prv->sbuf = prv->pool + len;
+-	prv->rbuf = prv->sbuf + B_CAS_BUFFER_MAX;
+-	prv->id.data = (int64_t *)(prv->rbuf + B_CAS_BUFFER_MAX);
+-	prv->id_max = 16;
+-	prv->pwc.data = (B_CAS_PWR_ON_CTRL *)(prv->id.data + prv->id_max);
+-	prv->pwc_max = 16;
+-
+-	ret = SCardListReaders(prv->mng, NULL, prv->reader, &len);
+-	if(ret != SCARD_S_SUCCESS){
+-		return B_CAS_CARD_ERROR_NO_SMART_CARD_READER;
+-	}
+-
+-	while( prv->reader[0] != 0 ){
+-		if(connect_card(prv, prv->reader)){
+-			break;
+-		}
+-		prv->reader += (_tcslen(prv->reader) + 1);
+-	}
+-
+-	if(prv->card == 0){
+-		return B_CAS_CARD_ERROR_ALL_READERS_CONNECTION_FAILED;
+-	}
++	memcpy(prv->stat.system_key, BCAS_SYSTEM_KEY, 32);
++	memcpy(prv->stat.init_cbc, BCAS_INIT_CBC, 8);
++	prv->stat.bcas_card_id = BCAS_CARD_ID;
++	prv->stat.card_status = 0;
++	prv->stat.ca_system_id = BCAS_CA_SYSTEM_ID;
+ 
+ 	return 0;
+ }
+@@ -208,7 +141,7 @@
+ 		return B_CAS_CARD_ERROR_INVALID_PARAMETER;
+ 	}
+ 
+-	if(prv->card == 0){
++	if(prv->stat.ca_system_id == 0){
+ 		return B_CAS_CARD_ERROR_NOT_INITIALIZED;
+ 	}
+ 
+@@ -219,150 +152,44 @@
+ 
+ static int get_id_b_cas_card(void *bcas, B_CAS_ID *dst)
+ {
+-	LONG ret;
+-	
+-	DWORD slen;
+-	DWORD rlen;
+-
+-	int i,num;
+-
+-	uint8_t *p;
+-	uint8_t *tail;
+-	
+ 	B_CAS_CARD_PRIVATE_DATA *prv;
+-	SCARD_IO_REQUEST sir;
+ 
+ 	prv = private_data(bcas);
+ 	if( (prv == NULL) || (dst == NULL) ){
+ 		return B_CAS_CARD_ERROR_INVALID_PARAMETER;
+ 	}
+ 
+-	if(prv->card == 0){
++	if(prv->stat.ca_system_id == 0){
+ 		return B_CAS_CARD_ERROR_NOT_INITIALIZED;
+ 	}
+ 
+-	slen = sizeof(CARD_ID_INFORMATION_ACQUIRE_CMD);
+-	memcpy(prv->sbuf, CARD_ID_INFORMATION_ACQUIRE_CMD, slen);
+-	memcpy(&sir, SCARD_PCI_T1, sizeof(sir));
+-	rlen = B_CAS_BUFFER_MAX;
+-
+-	ret = SCardTransmit(prv->card, SCARD_PCI_T1, prv->sbuf, slen, &sir, prv->rbuf, &rlen);
+-	if( (ret != SCARD_S_SUCCESS) || (rlen < 19) ){
+-		return B_CAS_CARD_ERROR_TRANSMIT_FAILED;
+-	}
+-
+-	p = prv->rbuf + 6;
+-	tail = prv->rbuf + rlen;
+-	if( p+1 > tail ){
+-		return B_CAS_CARD_ERROR_TRANSMIT_FAILED;
+-	}
+-
+-	num = p[0];
+-	if(num > prv->id_max){
+-		if(change_id_max(prv, num+4) < 0){
+-			return B_CAS_CARD_ERROR_NO_ENOUGH_MEMORY;
+-		}
+-	}
+-	
+-	p += 1;
+-	for(i=0;i<num;i++){
+-		if( p+10 > tail ){
+-			return B_CAS_CARD_ERROR_TRANSMIT_FAILED;
+-		}
+-
+-		prv->id.data[i] = load_be_uint48(p+2);
+-		p += 10;
+-	}
+-
+-	prv->id.count = num;
+-
+-	memcpy(dst, &(prv->id), sizeof(B_CAS_ID));
++	memset(dst, 0, sizeof(B_CAS_ID));
+ 
+ 	return 0;
+ }
+ 
+ static int get_pwr_on_ctrl_b_cas_card(void *bcas, B_CAS_PWR_ON_CTRL_INFO *dst)
+ {
+-	LONG ret;
+-	
+-	DWORD slen;
+-	DWORD rlen;
+-
+-	int i,num,code;
+-
+ 	B_CAS_CARD_PRIVATE_DATA *prv;
+-	SCARD_IO_REQUEST sir;
+-
+-	memset(dst, 0, sizeof(B_CAS_PWR_ON_CTRL_INFO));
+ 
+ 	prv = private_data(bcas);
+ 	if( (prv == NULL) || (dst == NULL) ){
+ 		return B_CAS_CARD_ERROR_INVALID_PARAMETER;
+ 	}
+ 
+-	if(prv->card == 0){
++	if(prv->stat.ca_system_id == 0){
+ 		return B_CAS_CARD_ERROR_NOT_INITIALIZED;
+ 	}
+ 
+-	slen = sizeof(POWER_ON_CONTROL_INFORMATION_REQUEST_CMD);
+-	memcpy(prv->sbuf, POWER_ON_CONTROL_INFORMATION_REQUEST_CMD, slen);
+-	prv->sbuf[5] = 0;
+-	memcpy(&sir, SCARD_PCI_T1, sizeof(sir));
+-	rlen = B_CAS_BUFFER_MAX;
+-
+-	ret = SCardTransmit(prv->card, SCARD_PCI_T1, prv->sbuf, slen, &sir, prv->rbuf, &rlen);
+-	if( (ret != SCARD_S_SUCCESS) || (rlen < 18) || (prv->rbuf[6] != 0) ){
+-		return B_CAS_CARD_ERROR_TRANSMIT_FAILED;
+-	}
+-
+-	code = load_be_uint16(prv->rbuf+4);
+-	if(code == 0xa101){
+-		/* no data */
+-		return 0;
+-	}else if(code != 0x2100){
+-		return B_CAS_CARD_ERROR_TRANSMIT_FAILED;
+-	}
+-
+-	num = (prv->rbuf[7] + 1);
+-	if(prv->pwc_max < num){
+-		if(change_pwc_max(prv, num+4) < 0){
+-			return B_CAS_CARD_ERROR_NO_ENOUGH_MEMORY;
+-		}
+-	}
+-
+-	extract_power_on_ctrl_response(prv->pwc.data+0, prv->rbuf);
+-
+-	for(i=1;i<num;i++){
+-		prv->sbuf[5] = i;
+-		rlen = B_CAS_BUFFER_MAX;
+-
+-		ret = SCardTransmit(prv->card, SCARD_PCI_T1, prv->sbuf, slen, &sir, prv->rbuf, &rlen);
+-		if( (ret != SCARD_S_SUCCESS) || (rlen < 18) || (prv->rbuf[6] != i) ){
+-			return B_CAS_CARD_ERROR_TRANSMIT_FAILED;
+-		}
+-
+-		extract_power_on_ctrl_response(prv->pwc.data+i, prv->rbuf);
+-	}
+-
+-	prv->pwc.count = num;
+-
+-	memcpy(dst, &(prv->pwc), sizeof(B_CAS_PWR_ON_CTRL_INFO));
++	memset(dst, 0, sizeof(B_CAS_PWR_ON_CTRL_INFO));
+ 
+ 	return 0;
+ }
+ 
+ static int proc_ecm_b_cas_card(void *bcas, B_CAS_ECM_RESULT *dst, uint8_t *src, int len)
+ {
+-	int retry_count;
+-	
+-	LONG ret;
+-	DWORD slen;
+-	DWORD rlen;
+-	
+ 	B_CAS_CARD_PRIVATE_DATA *prv;
+ 
+-	SCARD_IO_REQUEST sir;
+-
+ 	prv = private_data(bcas);
+ 	if( (prv == NULL) ||
+ 	    (dst == NULL) ||
+@@ -371,50 +198,22 @@
+ 		return B_CAS_CARD_ERROR_INVALID_PARAMETER;
+ 	}
+ 
+-	if(prv->card == 0){
++	if(prv->stat.ca_system_id == 0){
+ 		return B_CAS_CARD_ERROR_NOT_INITIALIZED;
+ 	}
+ 
+-	slen = setup_ecm_receive_command(prv->sbuf, src, len);
+-	memcpy(&sir, SCARD_PCI_T1, sizeof(sir));
+-	rlen = B_CAS_BUFFER_MAX;
+-
+-	retry_count = 0;
+-	ret = SCardTransmit(prv->card, SCARD_PCI_T1, prv->sbuf, slen, &sir, prv->rbuf, &rlen);
+-	while( ((ret != SCARD_S_SUCCESS) || (rlen < 25)) && (retry_count < 10) ){
+-		retry_count += 1;
+-		if(!connect_card(prv, prv->reader)){
+-			continue;
+-		}
+-		slen = setup_ecm_receive_command(prv->sbuf, src, len);
+-		memcpy(&sir, SCARD_PCI_T1, sizeof(sir));
+-		rlen = B_CAS_BUFFER_MAX;
+-
+-		ret = SCardTransmit(prv->card, SCARD_PCI_T1, prv->sbuf, slen, &sir, prv->rbuf, &rlen);
+-	}
+-
+-	if( (ret != SCARD_S_SUCCESS) || (rlen < 25) ){
++	if (BCAS_Decoder_DecodeECM(dst->scramble_key, (ECM_t *)src) < 0) {
+ 		return B_CAS_CARD_ERROR_TRANSMIT_FAILED;
+ 	}
+-
+-	memcpy(dst->scramble_key, prv->rbuf+6, 16);
+-	dst->return_code = load_be_uint16(prv->rbuf+4);
++	dst->return_code = 0x0800;
+ 
+ 	return 0;
+ }
+ 
+ static int proc_emm_b_cas_card(void *bcas, uint8_t *src, int len)
+ {
+-	int retry_count;
+-	
+-	LONG ret;
+-	DWORD slen;
+-	DWORD rlen;
+-	
+ 	B_CAS_CARD_PRIVATE_DATA *prv;
+ 
+-	SCARD_IO_REQUEST sir;
+-
+ 	prv = private_data(bcas);
+ 	if( (prv == NULL) ||
+ 	    (src == NULL) ||
+@@ -422,32 +221,10 @@
+ 		return B_CAS_CARD_ERROR_INVALID_PARAMETER;
+ 	}
+ 
+-	if(prv->card == 0){
++	if(prv->stat.ca_system_id == 0){
+ 		return B_CAS_CARD_ERROR_NOT_INITIALIZED;
+ 	}
+ 
+-	slen = setup_emm_receive_command(prv->sbuf, src, len);
+-	memcpy(&sir, SCARD_PCI_T1, sizeof(sir));
+-	rlen = B_CAS_BUFFER_MAX;
+-
+-	retry_count = 0;
+-	ret = SCardTransmit(prv->card, SCARD_PCI_T1, prv->sbuf, slen, &sir, prv->rbuf, &rlen);
+-	while( ((ret != SCARD_S_SUCCESS) || (rlen < 6)) && (retry_count < 2) ){
+-		retry_count += 1;
+-		if(!connect_card(prv, prv->reader)){
+-			continue;
+-		}
+-		slen = setup_emm_receive_command(prv->sbuf, src, len);
+-		memcpy(&sir, SCARD_PCI_T1, sizeof(sir));
+-		rlen = B_CAS_BUFFER_MAX;
+-
+-		ret = SCardTransmit(prv->card, SCARD_PCI_T1, prv->sbuf, slen, &sir, prv->rbuf, &rlen);
+-	}
+-
+-	if( (ret != SCARD_S_SUCCESS) || (rlen < 6) ){
+-		return B_CAS_CARD_ERROR_TRANSMIT_FAILED;
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -472,274 +249,107 @@
+ 	return r;
+ }
+ 
+-static void teardown(B_CAS_CARD_PRIVATE_DATA *prv)
+-{
+-	if(prv->card != 0){
+-		SCardDisconnect(prv->card, SCARD_LEAVE_CARD);
+-		prv->card = 0;
+-	}
+-
+-	if(prv->mng != 0){
+-		SCardReleaseContext(prv->mng);
+-		prv->mng = 0;
+-	}
+-
+-	if(prv->pool != NULL){
+-		free(prv->pool);
+-		prv->pool = NULL;
+-	}
+-
+-	prv->reader = NULL;
+-	prv->sbuf = NULL;
+-	prv->rbuf = NULL;
+-	prv->id.data = NULL;
+-	prv->id_max = 0;
+-}
+-
+-static int change_id_max(B_CAS_CARD_PRIVATE_DATA *prv, int max)
+-{
+-	int m;
+-	int reader_size;
+-	int pwctrl_size;
+-	
+-	uint8_t *p;
+-	uint8_t *old_reader;
+-	uint8_t *old_pwctrl;
+-
+-	reader_size = prv->sbuf - prv->pool;
+-	pwctrl_size = prv->pwc.count * sizeof(B_CAS_PWR_ON_CTRL);
+-
+-	m  = reader_size;
+-	m += (2*B_CAS_BUFFER_MAX);
+-	m += (max*sizeof(int64_t));
+-	m += (prv->pwc_max*sizeof(B_CAS_PWR_ON_CTRL));
+-	p = (uint8_t *)malloc(m);
+-	if(p == NULL){
+-		return B_CAS_CARD_ERROR_NO_ENOUGH_MEMORY;
+-	}
+-
+-	old_reader = (uint8_t *)(prv->reader);
+-	old_pwctrl = (uint8_t *)(prv->pwc.data);
+-
+-	prv->reader = (LPTSTR)p;
+-	prv->sbuf = prv->pool + reader_size;
+-	prv->rbuf = prv->sbuf + B_CAS_BUFFER_MAX;
+-	prv->id.data = (int64_t *)(prv->rbuf + B_CAS_BUFFER_MAX);
+-	prv->id_max = max;
+-	prv->pwc.data = (B_CAS_PWR_ON_CTRL *)(prv->id.data + prv->id_max);
+-
+-	memcpy(prv->reader, old_reader, reader_size);
+-	memcpy(prv->pwc.data, old_pwctrl, pwctrl_size);
+-	
+-	free(prv->pool);
+-	prv->pool = p;
+-
+-	return 0;
+-}
+-
+-static int change_pwc_max(B_CAS_CARD_PRIVATE_DATA *prv, int max)
+-{
+-	int m;
+-	int reader_size;
+-	int cardid_size;
+-	
+-	uint8_t *p;
+-	uint8_t *old_reader;
+-	uint8_t *old_cardid;
+-
+-	reader_size = prv->sbuf - prv->pool;
+-	cardid_size = prv->id.count * sizeof(int64_t);
+-
+-	m  = reader_size;
+-	m += (2*B_CAS_BUFFER_MAX);
+-	m += (prv->id_max*sizeof(int64_t));
+-	m += (max*sizeof(B_CAS_PWR_ON_CTRL));
+-	p = (uint8_t *)malloc(m);
+-	if(p == NULL){
+-		return B_CAS_CARD_ERROR_NO_ENOUGH_MEMORY;
+-	}
+-
+-	old_reader = (uint8_t *)(prv->reader);
+-	old_cardid = (uint8_t *)(prv->id.data);
+-
+-	prv->reader = (LPTSTR)p;
+-	prv->sbuf = prv->pool + reader_size;
+-	prv->rbuf = prv->sbuf + B_CAS_BUFFER_MAX;
+-	prv->id.data = (int64_t *)(prv->rbuf + B_CAS_BUFFER_MAX);
+-	prv->pwc.data = (B_CAS_PWR_ON_CTRL *)(prv->id.data + prv->id_max);
+-	prv->pwc_max = max;
+-
+-	memcpy(prv->reader, old_reader, reader_size);
+-	memcpy(prv->id.data, old_cardid, cardid_size);
+-	
+-	free(prv->pool);
+-	prv->pool = p;
+-
+-	return 0;
+-}
+-
+-static int connect_card(B_CAS_CARD_PRIVATE_DATA *prv, LPCTSTR reader_name)
++static int LoadKeyset()
+ {
+-	int m,n;
+-	
+-	LONG ret;
+-	DWORD rlen,protocol;
+-
+-	uint8_t *p;
+-	
+-	SCARD_IO_REQUEST sir;
+-
+-	if(prv->card != 0){
+-		SCardDisconnect(prv->card, SCARD_RESET_CARD);
+-		prv->card = 0;
+-	}
++	const int MAX_LEN = 1024;
++	Dl_info info;
++	FILE *fp = NULL;
++	char *p;
++	char buf[MAX_LEN];
++	int i, len, keyCount = 0;
++	uint8_t gid, kid;
+ 
+-	ret = SCardConnect(prv->mng, reader_name, SCARD_SHARE_SHARED, SCARD_PROTOCOL_T1, &(prv->card), &protocol);
+-	if(ret != SCARD_S_SUCCESS){
+-		return 0;
++	if(dladdr((void *)LoadKeyset, &info) == 0){
++		return -1;
+ 	}
+-
+-	m = sizeof(INITIAL_SETTING_CONDITIONS_CMD);
+-	memcpy(prv->sbuf, INITIAL_SETTING_CONDITIONS_CMD, m);
+-	memcpy(&sir, SCARD_PCI_T1, sizeof(sir));
+-	rlen = B_CAS_BUFFER_MAX;
+-	ret = SCardTransmit(prv->card, SCARD_PCI_T1, prv->sbuf, m, &sir, prv->rbuf, &rlen);
+-	if(ret != SCARD_S_SUCCESS){
+-		return 0;
++	strncpy(buf, info.dli_fname, MAX_LEN-1);
++	buf[MAX_LEN-1] = '\0';
++	p = strrchr(buf, '/');
++	if(p != NULL){
++		*(p+1) = '\0';
++	}else{
++		buf[0] = '\0';
+ 	}
+-
+-	if(rlen < 57){
+-		return 0;
++	len = strlen(CONF_FILE);
++	if(MAX_LEN - strlen(buf) - len > 0){
++		strcat(buf, CONF_FILE);
++		fp = fopen(buf, "r");
+ 	}
+-	
+-	p = prv->rbuf;
+-
+-	n = load_be_uint16(p+4);
+-	if(n != 0x2100){ // return code missmatch
+-		return 0;
++	if(fp == NULL){
++		if(MAX_LEN - strlen(LIB_DIR) - len > 0){
++			strcpy(buf, LIB_DIR);
++			strcat(buf, CONF_FILE);
++			fp = fopen(buf, "r");
++		}
++		if(fp == NULL){
++			return B_CAS_CARD_ERROR_NO_SMART_CARD_READER;
++		}
+ 	}
+ 
+-	memcpy(prv->stat.system_key, p+16, 32);
+-	memcpy(prv->stat.init_cbc, p+48, 8);
+-	prv->stat.bcas_card_id = load_be_uint48(p+8);
+-	prv->stat.card_status = load_be_uint16(p+2);
+-	prv->stat.ca_system_id = load_be_uint16(p+6);
+-
+-	return 1;
+-}
+-
+-static void extract_power_on_ctrl_response(B_CAS_PWR_ON_CTRL *dst, uint8_t *src)
+-{
+-	int referrence;
+-	int start;
+-	int limit;
+-	
+-	
+-	dst->broadcaster_group_id = src[8];
+-	referrence = (src[9]<<8)|src[10];
+-	start = referrence - src[11];
+-	limit = start + (src[12]-1);
+-
+-	extract_mjd(&(dst->s_yy), &(dst->s_mm), &(dst->s_dd), start);
+-	extract_mjd(&(dst->l_yy), &(dst->l_mm), &(dst->l_dd), limit);
++	while(keyCount < MAX_KEY_COUNT){
++		if(fgets(buf, sizeof(buf), fp) == NULL){
++			break;
++		}
+ 
+-	dst->hold_time = src[13];
+-	dst->network_id = (src[14]<<8)|src[15];
+-	dst->transport_id = (src[16]<<8)|src[17];
+-	
+-}
++		if(buf[0] == ';'){
++			continue;
++		}
+ 
+-static void extract_mjd(int *yy, int *mm, int *dd, int mjd)
+-{
+-	int a1,m1;
+-	int a2,m2;
+-	int a3,m3;
+-	int a4,m4;
+-	int mw;
+-	int dw;
+-	int yw;
+-	
+-	mjd -= 51604; // 2000,3/1
+-	if(mjd < 0){
+-		mjd += 0x10000;
+-	}
++		len = strlen(buf);
++		p = strstr(buf, "Kw");
++		if(len < 22 || p == NULL){
++			continue;
++		}
+ 
+-	a1 = mjd / 146097;
+-	m1 = mjd % 146097;
+-	a2 = m1 / 36524;
+-	m2 = m1 - (a2 * 36524);
+-	a3 = m2 / 1461;
+-	m3 = m2 - (a3 * 1461);
+-	a4 = m3 / 365;
+-	if(a4 > 3){
+-		a4 = 3;
++		p += 2;
++		gid = pickup_hex(&p, 2) & 0xff;
++		if(gid == 0){
++			continue;
++		}
++		for(i=0;i<2;i++){
++			kid = pickup_hex(&p, 2) & 0xff;
++			if(kid == 0){
++				break;
++			}
++			KeysetTable[keyCount] = (KEYSET_t *)malloc(sizeof(KEYSET_t));
++			if(KeysetTable[keyCount] == NULL){
++				fclose(fp);
++				return B_CAS_CARD_ERROR_NO_ENOUGH_MEMORY;
++			}
++			KeysetTable[keyCount]->BroadcastGroupId = gid;
++			KeysetTable[keyCount]->WorkKeyId = kid;
++			KeysetTable[keyCount]->WorkKey = pickup_hex(&p, 16);
++			keyCount++;
++			if(len + buf - p < 18 ){
++				break;
++			}
++		}
+ 	}
+-	m4 = m3 - (a4 * 365);
+-	
+-	mw = (1071*m4+450) >> 15;
+-	dw = m4 - ((979*mw+16) >> 5);
+-
+-	yw = a1*400 + a2*100 + a3*4 + a4 + 2000;
+-	mw += 3;
+-	if(mw > 12){
+-		mw -= 12;
+-		yw += 1;
++	if(keyCount < MAX_KEY_COUNT){
++		KeysetTable[keyCount] = NULL;
+ 	}
+-	dw += 1;
+-
+-	*yy = yw;
+-	*mm = mw;
+-	*dd = dw;
+-}
+-
+-static int setup_ecm_receive_command(uint8_t *dst, uint8_t *src, int len)
+-{
+-	int r;
+-	
+-	r  = sizeof(ECM_RECEIVE_CMD_HEADER);
+-	memcpy(dst+0, ECM_RECEIVE_CMD_HEADER, r);
+-	dst[r] = (uint8_t)(len & 0xff);
+-	r += 1;
+-	memcpy(dst+r, src, len);
+-	r += len;
+-	dst[r] = 0;
+-	r += 1;
+-
+-	return r;
+-}
+-
+-static int setup_emm_receive_command(uint8_t *dst, uint8_t *src, int len)
+-{
+-	int r;
+-
+-	r  = sizeof(EMM_RECEIVE_CMD_HEADER);
+-	memcpy(dst+0, EMM_RECEIVE_CMD_HEADER, r);
+-	dst[r] = (uint8_t)(len & 0xff);
+-	r += 1;
+-	memcpy(dst+r, src, len);
+-	r += len;
+-	dst[r] = 0;
+-	r += 1;
+ 
+-	return r;
+-}
+-
+-static int32_t load_be_uint16(uint8_t *p)
+-{
+-	return ((p[0]<<8)|p[1]);
++	fclose(fp);
++	return 0;
+ }
+ 
+-static int64_t load_be_uint48(uint8_t *p)
++static uint64_t pickup_hex(char **pp, int n)
+ {
+-	int i;
+-	int64_t r;
+-
+-	r = p[0];
+-	for(i=1;i<6;i++){
+-		r <<= 8;
+-		r |= p[i];
++	uint64_t x = 0;
++	char *p = *pp;
++	while(*p && n > 0){
++		int c = *p++;
++		if(c < '0' || (c > '9' && c < 'A') || (c > 'F' && c < 'a') || c > 'f'){
++			continue;
++		}
++		c |= 'a' - 'A'; /* to lower case */
++		c -= '0';
++		if(c > 9){
++			c -= 'a' - ('0'+10);
++		}
++		x <<= 4, x |= c;
++		--n;
+ 	}
+-
+-	return r;
++	*pp = p;
++	return x;
+ }
+-
+
+--- src/bcas_crypt.c
++++ src/bcas_crypt.c
+@@ -0,0 +1,230 @@
++/**
++ * @file bcas_crypt.c
++ *
++ *	original code from http://pastebin.com/xsL2j1ti
++ */
++#include "bcas_crypt.h"
++
++static inline uint64_t load_le64(const uint8_t *p)
++{
++	uint64_t x = 0;
++	x |= (uint64_t)p[7] << 56;
++	x |= (uint64_t)p[6] << 48;
++	x |= (uint64_t)p[5] << 40;
++	x |= (uint64_t)p[4] << 32;
++	x |= (uint64_t)p[3] << 24;
++	x |= (uint64_t)p[2] << 16;
++	x |= (uint64_t)p[1] << 8;
++	x |= (uint64_t)p[0];
++	return x;
++}
++
++static inline uint64_t load_be64(const uint8_t *p)
++{
++	uint64_t x = 0;
++	x |= (uint64_t)p[7];
++	x |= (uint64_t)p[6] << 8;
++	x |= (uint64_t)p[5] << 16;
++	x |= (uint64_t)p[4] << 24;
++	x |= (uint64_t)p[3] << 32;
++	x |= (uint64_t)p[2] << 40;
++	x |= (uint64_t)p[1] << 48;
++	x |= (uint64_t)p[0] << 56;
++	return x;
++}
++
++static inline void store_be64(uint64_t x, uint8_t *p)
++{
++	p[7] = (uint8_t)(x);
++	p[6] = (uint8_t)(x >> 8);
++	p[5] = (uint8_t)(x >> 16);
++	p[4] = (uint8_t)(x >> 24);
++	p[3] = (uint8_t)(x >> 32);
++	p[2] = (uint8_t)(x >> 40);
++	p[1] = (uint8_t)(x >> 48);
++	p[0] = (uint8_t)(x >> 56);
++}
++
++static inline void store_le64(uint64_t x, uint8_t *p)
++{
++	p[7] = (uint8_t)(x >> 56);
++	p[6] = (uint8_t)(x >> 48);
++	p[5] = (uint8_t)(x >> 40);
++	p[4] = (uint8_t)(x >> 32);
++	p[3] = (uint8_t)(x >> 24);
++	p[2] = (uint8_t)(x >> 16);
++	p[1] = (uint8_t)(x >> 8);
++	p[0] = (uint8_t)(x);
++}
++
++static inline uint32_t rotate32r(uint32_t x, int n)
++{
++	return (x >> n) | (x << (32 - n));
++}
++
++static inline uint32_t rotate32l(uint32_t x, int n)
++{
++	return (x << n) | (x >> (32 - n));
++}
++
++static inline int parity(uint32_t x)
++{
++	x ^= x >> 16;
++	x ^= x >> 8;
++	x ^= x >> 4;
++	x ^= x >> 2;
++	x ^= x >> 1;
++	return x & 1;
++}
++
++static uint32_t sbox40(uint32_t x)
++{
++	static const uint8_t sbox[256] = {
++		0xAA, 0xA2, 0x10, 0xFA, 0xA9, 0xF0, 0x40, 0x2F, 0xB1, 0x1C, 0x1A, 0x6F, 0x43, 0xB4, 0x73, 0xBC,
++		0x69, 0x77, 0xC5, 0x00, 0xF3, 0xD4, 0x09, 0x7E, 0x58, 0x8D, 0x44, 0xC3, 0xF5, 0x54, 0x0C, 0xDD,
++		0x3F, 0xB7, 0xD1, 0xD6, 0x9A, 0xD3, 0x39, 0x82, 0x01, 0x5E, 0x03, 0xED, 0x78, 0x63, 0x90, 0x49,
++		0x9B, 0x15, 0xA8, 0x4F, 0x67, 0x52, 0xAC, 0xE4, 0x37, 0xEA, 0xF7, 0x23, 0x55, 0x0F, 0x42, 0x12,
++		0xE3, 0x05, 0x5F, 0x2D, 0x2E, 0x7F, 0x11, 0x38, 0x07, 0xF4, 0x3C, 0xE2, 0xD5, 0x9F, 0xDF, 0xCF,
++		0x30, 0x0B, 0xAD, 0x66, 0x22, 0x70, 0xEF, 0x7B, 0xA6, 0x24, 0x65, 0x0D, 0x5D, 0x79, 0x02, 0x4D,
++		0x0E, 0x32, 0x84, 0x97, 0xB8, 0x57, 0x34, 0xE8, 0x41, 0x87, 0xC1, 0xF9, 0x9C, 0x56, 0xAE, 0x71,
++		0xAB, 0xBF, 0xD0, 0x88, 0x25, 0xC8, 0x1F, 0xD7, 0xFE, 0x04, 0x4E, 0xCE, 0x51, 0x81, 0xBB, 0xCD,
++		0x91, 0xA5, 0x14, 0x75, 0xA4, 0x60, 0x61, 0x6E, 0x7A, 0xE6, 0x99, 0xD8, 0xA0, 0x4C, 0xDC, 0x1B,
++		0x06, 0x6C, 0x3E, 0x9E, 0xF8, 0xCB, 0x98, 0x92, 0x0A, 0xFB, 0x2A, 0xCA, 0x50, 0x7C, 0xC0, 0x83,
++		0x94, 0xB5, 0x6A, 0x21, 0x95, 0xB3, 0x48, 0xD9, 0x16, 0xA7, 0xEE, 0x4B, 0xFD, 0x9D, 0xBD, 0x6B,
++		0xC6, 0x80, 0x20, 0x3A, 0x53, 0x1E, 0x5C, 0xC7, 0xB6, 0x08, 0xAF, 0xA1, 0x2B, 0x19, 0x26, 0x8A,
++		0x47, 0xE1, 0x86, 0x74, 0xE9, 0x59, 0x62, 0x8B, 0x28, 0x6D, 0xEC, 0x76, 0xB0, 0x45, 0xC2, 0x46,
++		0x4A, 0xE0, 0xF2, 0x8C, 0xBE, 0x3B, 0x5B, 0xBA, 0x31, 0x96, 0xE5, 0x36, 0x8E, 0xEB, 0xE7, 0xB9,
++		0xA3, 0x35, 0x17, 0x68, 0x27, 0x8F, 0x85, 0x89, 0x29, 0x93, 0xFF, 0xFC, 0xDE, 0x7D, 0x18, 0xDB,
++		0x64, 0xF6, 0x1D, 0xB2, 0x3D, 0xF1, 0xC9, 0x13, 0xDA, 0xCC, 0xC4, 0x72, 0x33, 0x5A, 0xD2, 0x2C
++	};
++	return ((sbox[0xff & (x >> 24)] << 24) |
++			(sbox[0xff & (x >> 16)] << 16) |
++			(sbox[0xff & (x >>  8)] <<  8) |
++			(sbox[0xff & (x)]));
++}
++
++static uint32_t round00(uint32_t x, uint32_t k, uint8_t flavor)
++{
++	const uint16_t salt = (flavor & 2) ? 0x5353 : 0x0000;
++	x = (0xffff & (x + k + salt)) | ((x >> 16) + (k >> 16) + salt) << 16;
++	x = ((x & 0xf0f0f0f0) >> 4) | ((x & 0x0f0f0f0f) << 4);
++	k = rotate32l(k, 1);
++	x = (parity(x & k)) ? x ^ ~k : x;
++	x = (flavor & 1)
++		? (x & 0xaa55aa55) | ((x & 0x55005500) >> 7) | ((x & 0x00aa00aa) << 7)
++		: (x & 0x55aa55aa) | ((x & 0xaa00aa00) >> 9) | ((x & 0x00550055) << 9);
++	x = (x & 0x00ffff00) | (x >> 24) | (x << 24);
++	x = x ^ rotate32r(x, 8) ^ rotate32r(x, 7);
++	return x;
++}
++
++static uint32_t round40(uint32_t x, uint32_t k)
++{
++	x = sbox40(x ^ k);
++	x ^= ((x & 0x007f007f) << 9) | ((x & 0x00800080) << 1);
++	x ^= ((x & 0x7f007f00) >> 7) | ((x & 0x80008000) >> 15);
++	x = rotate32l(x, 8);
++	x ^= ((x & 0x3f003f00) >> 6) | ((x & 0xc000c000) >> 14);
++	x ^= ((x & 0x003f003f) << 10) | ((x & 0x00c000c0) << 2);
++	x = rotate32r(x, 8);
++	return x;
++}
++
++static inline uint64_t block00(uint64_t block, const uint32_t kext[4])
++{
++	static const uint8_t flavor[] = {
++		1, 0, 1, 2, 2, 2, 0, 2, 1, 3, 0, 2, 1, 0, 0, 1
++	};
++	int r;
++	uint32_t left = (uint32_t)(block >> 32), right = (uint32_t)block;
++	for (r = 15; r >= 0;) {
++		left  ^= round00(right, kext[r & 3], flavor[r]), r--;
++		right ^= round00(left , kext[r & 3], flavor[r]), r--;
++	}
++	return ((uint64_t)right << 32) | left;
++}
++
++static inline uint64_t block40(uint64_t block, const uint32_t kext[16], uint8_t protocol)
++{
++	int r;
++	uint32_t left, right;
++	const uint64_t salt = (protocol & 0x0c) ? 0xfbe852461acd3970LL : 0xd34c027be8579632LL;
++	block += salt;
++	left = (uint32_t)(block >> 32), right = (uint32_t)block;
++	for (r = 15; r >= 0;) {
++		right ^= round40(left , kext[r--]);
++		left  ^= round40(right, kext[r--]);
++	}
++	block = ((uint64_t)right << 32) | left;
++	block -= salt;
++	return block;
++}
++
++static inline void keysched00(uint32_t kext[4], uint64_t key, uint8_t protocol)
++{
++	int i;
++	uint32_t chain = (protocol & 0x0c) ? 0x84e5c4e7 : 0x6aa32b6f;
++	kext[0] = (uint32_t)(key >> 32);
++	kext[1] = (uint32_t)key;
++	kext[2] = 0x08090a0b;
++	kext[3] = 0x0c0d0e0f;
++	for (i = 0; i < 8; i++) {
++		kext[i & 3] = chain = round00(kext[i & 3], chain, 0);
++	}
++}
++
++static inline void keysched40(uint32_t kext[16], uint64_t key)
++{
++	int i;
++	uint32_t left, right;
++	key = (key & 0x00ffff0000ffff00LL) | ((key & 0xff000000ff000000LL) >> 24) | ((key & 0x000000ff000000ffLL) << 24);
++	key = (key & 0x0000ffffffff0000LL) | ((key & 0xffff000000000000LL) >> 48) | ((key & 0x000000000000ffffLL) << 48);
++	left = (uint32_t)(key >> 32), right = (uint32_t)key;
++	for (i = 0; i < 16; i++) {
++		uint32_t s = sbox40(right);
++		s = (0x00ffff00 & (s ^ left)) | (0xff0000ff & ((s & 0xff0000ff) + (left & 0xff0000ff)));
++		left = right;
++		right = rotate32r(s, 8);
++		kext[i] = s;
++	}
++}
++
++static inline void cipher00(uint8_t *out, const uint8_t *in, uint64_t key, uint8_t protocol)
++{
++	int i;
++	uint64_t chain = 0xfe27199919690911ULL;
++	uint32_t kext[4];
++	keysched00(kext, key, protocol);
++	for (i=0; i<2; i++) {
++		const uint64_t crypt = load_be64(in);
++		const uint64_t plain = block00(crypt, kext) ^ chain;
++		store_be64(plain, out);
++		chain = crypt;
++		in += 8, out += 8;
++	}
++}
++
++static inline void cipher40(uint8_t *out, const uint8_t *in, uint64_t key, uint8_t protocol)
++{
++	int i;
++	uint64_t chain = 0x11096919991927feLL;
++	uint32_t kext[16];
++	keysched40(kext, key);
++	for (i=0; i<2; i++) {
++		const uint64_t crypt = load_le64(in);
++		const uint64_t plain = block40(crypt, kext, protocol) ^ chain;
++		store_le64(plain, out);
++		chain = crypt;
++		in += 8, out += 8;
++	}
++}
++
++void bcas_decrypt(uint8_t *out, const uint8_t *in, uint64_t key, uint8_t protocol)
++{
++	if (protocol & 0x40) {
++		cipher40(out, in, key, protocol);
++	}
++	else {
++		cipher00(out, in, key, protocol);
++	}
++}
+
+--- src/bcas_crypt.h
++++ src/bcas_crypt.h
+@@ -0,0 +1,9 @@
++/**
++ * @file bcas_crypt.h
++ *
++ *	original code from http://pastebin.com/xsL2j1ti
++ */
++#pragma once
++#include "portable.h"
++
++extern void bcas_decrypt(uint8_t *out, const uint8_t *in, uint64_t key, uint8_t protocol);
+
+--- src/decode_ecm.c
++++ src/decode_ecm.c
+@@ -0,0 +1,34 @@
++/**
++ * @file decode_ecm.c
++ *
++ * original code from Oishii Yakisoba source.
++ */
++#include "bcas_crypt.h"
++#include "decode_ecm.h"
++
++KEYSET_t *KeysetTable[MAX_KEY_COUNT];
++
++int BCAS_Decoder_DecodeECM(uint8_t *ScramblingKeys, const ECM_t *in)
++{
++	int i;
++	uint64_t WorkKey = 0;
++
++	for (i = 0; i < MAX_KEY_COUNT; i++) {
++		if (!KeysetTable[i]) {
++			break;
++		}
++		if (KeysetTable[i]->BroadcastGroupId == in->BroadcastGroupId &&
++		    KeysetTable[i]->WorkKeyId == in->WorkKeyId) {
++			WorkKey = KeysetTable[i]->WorkKey;
++			break;
++		}
++	}
++
++	if (!WorkKey) {
++		return -1;
++	}
++
++	bcas_decrypt(ScramblingKeys, (uint8_t *)&in->ScramblingKeys, WorkKey, in->ProtocolNumber);
++
++	return 0;
++}
+
+--- src/decode_ecm.h
++++ src/decode_ecm.h
+@@ -0,0 +1,30 @@
++/**
++ * @file decode_ecm.h
++ *
++ * original code from Oishii Yakisoba source.
++ */
++#pragma once
++#include "portable.h"
++
++#define MAX_KEY_COUNT 64
++
++typedef struct {
++	uint8_t ProtocolNumber;
++	uint8_t BroadcastGroupId;
++	uint8_t WorkKeyId;
++
++	struct {
++		uint8_t  odd[8];
++		uint8_t even[8];
++	} ScramblingKeys;
++} ECM_t;
++
++typedef struct {
++	uint8_t BroadcastGroupId;
++	uint8_t WorkKeyId;
++	uint64_t WorkKey;
++} KEYSET_t;
++
++extern KEYSET_t *KeysetTable[];
++
++extern int BCAS_Decoder_DecodeECM(uint8_t *ScramblingKeys, const ECM_t *in);
+
